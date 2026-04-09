@@ -1,0 +1,84 @@
+{
+    "_id": "pipe:taneira-scm:public:0xaed:PurchaseReq",
+    "workspace": "taneira-scm",
+    "name": "FirstSampleCompleted to AuditRequest",
+    "txnType": "public",
+    "projectId": "5eee03c25e87df8a5872",
+    "portal": "Buyer",
+    "description": "",
+    "batchSize": 100,
+    "version": 86,
+    "enabled": true,
+    "ownerType": "user",
+    "xChangeParamIDs": [
+        "0x32709F05Ca0c385d75B029509c90859bf03a14FB"
+    ],
+    "sm": {
+        "smId": "public:0xaed0b39a809d7c027a8f17434a585fffaec96a857e7407e3d8476f353118f6ae",
+        "smType": "document",
+        "stateTo": "PurchaseReq",
+        "docType": "",
+        "smChain": "onchain"
+    },
+    "roles": {
+        "bindings": [],
+        "strategy": "json_only"
+    },
+    "source": {
+        "type": "nats",
+        "format": "json",
+        "docIdField": "DocDetails.D_Identifier",
+        "cleansing": true,
+        "cleansingScript": "import time\nimport json\nfrom typing import Optional, Any\n\nconfig = {\n    \"stateTo\": \"PurchaseReq\",\n    \"smId\": \"public:0xaed0b39a809d7c027a8f17434a585fffaec96a857e7407e3d8476f353118f6ae\"\n}\n\nCONSTANTS = {\n    \"COLLECTIONS\": {\n        \"FULLPROD\": \"sm_fullprod_b503e5\",\n        \"ORDERS\": \"sm_orders_b503e5\",\n        \"PURCHASEREQ\": \"sm_purchasereq_aed0b3\",\n        \"CATALOGUE\": \"sm_addcatalogue_36be89\"\n    },\n    \"ERROR_MESSAGES\": {\n        \"MISSING_RAW_CONTENT\": \"Missing 'rawContent' in payload\",\n        \"MALFORMED_JSON\": \"Invalid JSON string provided in 'rawContent'\",\n        \"MISSING_DOC_ID\": \"Parsed JSON is missing 'docId'\",\n        \"FULLPROD_NOT_FOUND\": \"Document not found in fullProd collection\",\n        \"NO_SKUS\": \"Document contains no SKUs\",\n        \"MISSING_ROOT_DOC\": \"Unable to get root document\",\n        \"MISSING_CONTACT\": \"Missing contact information\",\n        \"MISSING_PONUMBER\": \"Missing PO Number in root document references\",\n        \"DB_REQUIRED\": \"Database connection is required\",\n        \"MISSING_HASH_VAL\": \"Missing value for hash generation\"\n    }\n}\n\ndef get_hash(value):\n    if not value:\n        raise ValueError(CONSTANTS[\"ERROR_MESSAGES\"][\"MISSING_HASH_VAL\"])\n    return utils.hash_id_hex(value)\n\ndef fetch_root_document(db, doc_id):\n    \"\"\"Fetches fullprod doc and corresponding order root doc\"\"\"\n    doc_input = db.find_one(CONSTANTS[\"COLLECTIONS\"][\"FULLPROD\"], {\"_id\": doc_id})\n    if not doc_input:\n        raise ValueError(CONSTANTS[\"ERROR_MESSAGES\"][\"FULLPROD_NOT_FOUND\"])\n\n    references = doc_input.get(\"DocDetails\", {}).get(\"D_ParentDocumentNumbers\", [])\n    if not references:\n        raise ValueError(CONSTANTS[\"ERROR_MESSAGES\"][\"MISSING_ROOT_DOC\"])\n\n    po_number = references[0]\n    if not po_number:\n        raise ValueError(CONSTANTS[\"ERROR_MESSAGES\"][\"MISSING_PONUMBER\"])\n    \n    logger.info(f\"Fetching root document for PO number: {po_number}\")\n    root_doc = db.find_one(CONSTANTS[\"COLLECTIONS\"][\"ORDERS\"], {\"DocDetails.D_DocumentNumber\": po_number})\n    logger.info(f\"Root document: {root_doc}, db: {db}\")\n\n    if not root_doc:\n        raise ValueError(CONSTANTS[\"ERROR_MESSAGES\"][\"MISSING_ROOT_DOC\"])\n\n    if not root_doc.get(\"Buyer\") or not root_doc.get(\"Seller\"):\n        raise ValueError(CONSTANTS[\"ERROR_MESSAGES\"][\"MISSING_CONTACT\"])\n        \n    return doc_input, root_doc, po_number\n\ndef get_po_quantities(root_doc):\n    \"\"\"Map PO quantities for validation lookup\"\"\"\n    po_lookup = {}\n    for item in root_doc.get(\"OrderedItems\", []):\n        sku = item.get(\"I_Number\")\n        if sku:\n            po_lookup[str(sku).strip()] = float(item.get(\"I_Quantity\", 0) or 0)\n    return po_lookup\n\ndef is_sku_eligible(db, sku_str, po_number, root_txn_id, po_qty, prod_qty):\n    \"\"\"Check if SKU is valid for audit processing\"\"\"\n    if prod_qty > po_qty:\n        print(f\"SKU {sku_str} production quantity ({prod_qty}) exceeds PO quantity ({po_qty}), skipping\")\n        return False\n        \n    approved_query = {\n        \"_local.rootTxn\": root_txn_id,\n        \"_local.state\": \"FullProd\",\n        \"_local.subState\": \"FirstSampleApproved\",\n        \"OrderedItems.I_Number\": sku_str\n    }\n    if db.find_one(CONSTANTS[\"COLLECTIONS\"][\"FULLPROD\"], approved_query):\n        print(f\"SKU {sku_str} is already approved, skipping\")\n        return False\n\n    existing_query = {\n        \"DocDetails.D_ParentDocumentNumbers\": po_number,\n        \"AnalysisReport.SKU\": sku_str\n    }\n    if db.find_one(CONSTANTS[\"COLLECTIONS\"][\"PURCHASEREQ\"], existing_query):\n        print(f\"Audit request already exists for SKU {sku_str}, skipping\")\n        return False\n\n    return True\n\ndef build_analysis_report(sku_str, po_number, root_doc, sku_details, po_qty, prod_qty, timestamp):\n    \"\"\"Build the analysis report map\"\"\"\n    tech = sku_details.get(\"TechDetails\", {})\n    items_meta = sku_details.get(\"Items\", {})\n    \n    return {\n        \"PONo\": po_number,\n        \"PODate\": root_doc.get(\"DocDetails\", {}).get(\"D_OrderedDate\", \"\"),\n        \"POExpiryDate\": root_doc.get(\"DocDetails\", {}).get(\"D_ExpiryDate\", \"\"),\n        \"SKU\": sku_str,\n        \"MaterialDescription\": items_meta.get(\"I_Description\", \"\"),\n        \"Craft\": tech.get(\"I_Workmanship\", \"\"),\n        \"ClusterOrigin\": tech.get(\"I_Cluster\", \"\"),\n        \"Category\": items_meta.get(\"I_Category\", \"\"),\n        \"SareeColor\": tech.get(\"I_BaseColor\", \"\"),\n        \"BlouseColor\": tech.get(\"I_BaseColor\", \"\"),\n        \"SKUQty\": po_qty,\n        \"ProducedQty\": prod_qty,\n        \"RemainingQty\": po_qty - prod_qty,\n        \"VendorCode\": root_doc.get(\"Seller\", {}).get(\"C_InternalID\", \"\"),\n        \"VendorName\": root_doc.get(\"Seller\", {}).get(\"C_Organization\", \"\"),\n        \"SampleSubmittedBy\": root_doc.get(\"Seller\", {}).get(\"C_Organization\", \"\"),\n        \"EndUse\": 'Saree',\n        \"ManufactureDate\": timestamp,\n        \"ProcurementType\": tech.get(\"I_ProcType\", \"\"),\n        \"BrandLabelAttached\": tech.get(\"I_BrandLabelAttached\", \"\"),\n        \"DesignNumber\": tech.get(\"I_DesignNumber\", \"\"),\n        \"FoldType\": tech.get(\"I_FoldType\", \"\"),\n        \"InspType\": tech.get(\"I_InspectionType\", \"\"),\n        \"WashCare\": tech.get(\"I_Washcare\", \"\"),\n        \"TaneiraSilkMarkTagNumber\": tech.get(\"I_TaneiraSilkMarkTagNumber\", \"\"),\n        \"Bulk1stPCSReviewDate\": tech.get(\"I_BulkFirstPcsReviewDate\", \"\"),\n        \"HandloomMarkIHB\": tech.get(\"I_HandloomMarkIHB\", \"\")\n    }\n\ndef build_parameters(sku_details):\n    \"\"\"Build the technical parameters map\"\"\"\n    tech = sku_details.get(\"TechDetails\", {})\n    return {\n        \"Requirement1\": tech.get(\"I_WarpMaterial\", \"\"),\n        \"Requirement2\": tech.get(\"I_WeftMaterial\", \"\"),\n        \"Requirement20\": tech.get(\"I_WarpMaterial\", \"\"),\n        \"Requirement21\": tech.get(\"I_WeftMaterial\", \"\"),\n        \"Requirement9\": tech.get(\"I_ZariType\", \"\"),\n        \"Requirement22\": tech.get(\"I_ZariType\", \"\"),\n        \"Requirement23\": tech.get(\"I_BaseColor\", \"\"),\n        \"Requirement24\": tech.get(\"I_BaseColor\", \"\"),\n        \"Requirement19\": tech.get(\"I_Workmanship\", \"\"),\n        \"Requirement18\": tech.get(\"I_WeightGMS\", \"\"),\n        \"Requirement5\": sku_details.get(\"AdditionalProperties\", {}).get(\"LoomType\", \"\")\n    }\n\ndef build_chain(doc_input):\n    \"\"\"Forms the _chain tracking object mapping parent-child execution lineage\"\"\"\n    chain = doc_input.get(\"_chain\", {})\n\n    refs = {\n        \"docIds\": [doc_input.get(\"_id\")] if doc_input.get(\"_id\") else [],\n        \"smId\": chain.get(\"smId\", \"\"),\n        \"stateTo\": chain.get(\"stateTo\", \"\")\n    }\n    return {\n        \"stateTo\": config[\"stateTo\"],\n        \"_sys\": chain.get(\"_sys\", {}),\n        \"createdAt\": int(time.time() * 1000),\n        \"refs\": refs,\n        \"roles\": chain.get(\"roles\", {}),\n        \"senderParamID\": chain.get(\"senderParamID\", \"\"),\n        \"smId\": config[\"smId\"]\n    }\n\ndef create_sku_audit_doc(db, item, sku_str, po_number, root_doc, doc_input, po_qty):\n    \"\"\"Orchestrator to generate full SKU document\"\"\"\n    prod_qty = float(item.get(\"I_Quantity\", 0) or 0)\n    root_txn_id = doc_input.get(\"_local\", {}).get(\"rootTxn\")\n    if isinstance(root_txn_id, list) and root_txn_id:\n        root_txn_id = root_txn_id[0]\n\n    if not is_sku_eligible(db, sku_str, po_number, root_txn_id, po_qty, prod_qty):\n        return None\n\n    cat_doc = db.find_one(CONSTANTS[\"COLLECTIONS\"][\"CATALOGUE\"], {\"Items.I_Number\": sku_str})\n    sku_details = cat_doc if cat_doc else {}\n    \n    timestamp = int(time.time() * 1000)\n    doc_number = f\"A/FSSA/{sku_str}/{timestamp}\"\n    new_doc_id = get_hash(doc_number)\n    \n    analysis_report = build_analysis_report(sku_str, po_number, root_doc, sku_details, po_qty, prod_qty, timestamp)\n    params = build_parameters(sku_details)\n    \n    tech = sku_details.get(\"TechDetails\", {})\n    pricing = sku_details.get(\"Pricing\", {})\n\n    chain = build_chain(doc_input)\n    \n    return {\n        \"_id\": new_doc_id,\n        \"DocDetails\": {\n            \"D_DocumentNumber\": doc_number,\n            \"D_DocumentCreationDate\": timestamp,\n            \"D_ParentDocumentNumbers\": [doc_input.get(\"DocDetails\", {}).get(\"D_DocumentNumber\", \"\")],\n            \"D_OrderedDate\": timestamp,\n            \"D_Identifier\": new_doc_id,\n            \"D_ItemCount\": 1\n        },\n        \"Buyer\": root_doc.get(\"Buyer\", {}),\n        \"Seller\": root_doc.get(\"Seller\", {}),\n        \"_participants\": root_doc.get(\"_participants\", {}),\n        \"OrderedItems\": [{\n            **item,\n            \"I_Identifier\": get_hash(sku_str),\n            \"I_Quantity\": prod_qty,\n            \"I_POQuantity\": po_qty,\n            \"I_RemainingQuantity\": po_qty - prod_qty,\n            \"I_BaseColor\": tech.get(\"I_BaseColor\", \"\"),\n            \"I_Price\": pricing.get(\"I_Price\", 0),\n            \"I_PriceCurrency\": pricing.get(\"I_PriceCurrency\", \"INR\"),\n            \"I_CatalogueType\": \"SKU\"\n        }],\n        \"AnalysisReport\": analysis_report,\n        \"Parameters\": params,\n        \"_chain\": chain\n    }\n\ndef run(doc: dict, db: Any = None) -> dict:\n    if db is None:\n        raise ValueError(CONSTANTS[\"ERROR_MESSAGES\"][\"DB_REQUIRED\"])\n\n    # 1. Initialize input: docId is provided to find the document\n    raw_content = doc.get(\"rawContent\")\n    if not raw_content:\n        raise ValueError(CONSTANTS[\"ERROR_MESSAGES\"][\"MISSING_RAW_CONTENT\"])\n\n    try:\n        parsed_content = json.loads(raw_content)\n    except ValueError:\n        raise ValueError(CONSTANTS[\"ERROR_MESSAGES\"][\"MALFORMED_JSON\"])\n\n    doc_id = parsed_content.get(\"docId\")\n    if not doc_id:\n        raise ValueError(CONSTANTS[\"ERROR_MESSAGES\"][\"MISSING_DOC_ID\"])\n\n    # 2. Extract context via root doc\n    doc_input, root_doc, po_number = fetch_root_document(db, doc_id)\n    po_lookup = get_po_quantities(root_doc)\n\n    generated_docs = []\n    \n    # 3. Process each SKU with delegated helper functions\n    ordered_items = doc_input.get(\"OrderedItems\", [])\n    for item in ordered_items:\n        sku = item.get(\"I_Number\")\n        if not sku:\n            continue\n            \n        sku_str = str(sku).strip()\n        po_qty = po_lookup.get(sku_str, 0)\n        \n        audit_doc = create_sku_audit_doc(db, item, sku_str, po_number, root_doc, doc_input, po_qty)\n        if audit_doc:\n            generated_docs.append(audit_doc)\n            \n    return {\"cleanedContent\": json.dumps({\"documents\": generated_docs}), \"format\": \"json\"}",
+        "defaultPriority": "medium",
+        "nats": {
+            "subject": "notifications.intent.taneira-scm",
+            "filter": {
+                "event": "document_created"
+            },
+            "extractDocId": "documents"
+        }
+    },
+    "parent": {
+        "smId": "public:0xb503e55d4718fe050659ae7f2347d06fdbd02498395b5c2994bed7cbcae1abca",
+        "stateTo": "FullProd:FirstSampleCompleted",
+        "refType": ""
+    },
+    "fieldMapping": {
+        "mode": "select_only"
+    },
+    "fields": [],
+    "transformHooks": {
+        "preTransform": {
+            "enabled": true,
+            "type": "script",
+            "timeoutMs": 3000,
+            "retryBackoffMs": 200,
+            "onPartialFailure": "continue",
+            "onTotalFailure": "fail_batch",
+            "script": "import json\nfrom typing import Optional, Any\n\ndef run(doc: dict, db: Any = None, config: Optional[dict] = None) -> dict:\n    raw_json = doc.get(\"__raw_json\")\n\n    if not raw_json:\n        raise ValueError(\"Missing '__raw_json' in document\")\n\n    try:\n        parsed = json.loads(raw_json)\n    except (ValueError, TypeError):\n        raise ValueError(\"Invalid JSON string provided in '__raw_json'\")\n    \n    return parsed"
+        },
+        "processMapping": {
+            "enabled": false,
+            "type": "external",
+            "method": "POST",
+            "timeoutMs": 3000,
+            "retryBackoffMs": 200,
+            "onPartialFailure": "continue",
+            "onTotalFailure": "fail_batch"
+        },
+        "postTransform": {
+            "enabled": false,
+            "type": "external",
+            "method": "POST",
+            "timeoutMs": 3000,
+            "retryBackoffMs": 200,
+            "onPartialFailure": "continue",
+            "onTotalFailure": "fail_batch"
+        }
+    },
+    "createdAt": "2026-04-06T14:43:05.558Z",
+    "updatedAt": "2026-04-09T06:24:55.26Z",
+    "createdBy": "",
+    "deleted": false
+}
