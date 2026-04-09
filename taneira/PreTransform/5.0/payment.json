@@ -1,0 +1,87 @@
+{
+    "_id": "pipe:taneira-scm:public:0x5b5:Payment",
+    "workspace": "taneira-scm",
+    "name": "Payment Import",
+    "txnType": "public",
+    "projectId": "5eee03c25e87df8a5872",
+    "portal": "Buyer",
+    "description": "",
+    "batchSize": 100,
+    "version": 13,
+    "enabled": true,
+    "ownerType": "user",
+    "xChangeParamIDs": [
+        "0x32709F05Ca0c385d75B029509c90859bf03a14FB"
+    ],
+    "sm": {
+        "smId": "public:0x5b5c87559104b3517df2cd795a6cef58485a17d09fec18dc44728bbb398e0e45",
+        "smType": "document",
+        "stateTo": "Payment",
+        "docType": "",
+        "smChain": "onchain"
+    },
+    "roles": {
+        "bindings": [
+            {
+                "role": "Buyer",
+                "strategy": "static",
+                "paramId": "0x10997bE7f49Dcd593846B29dd0eB74b9ded9D967"
+            }
+        ],
+        "strategy": "pipeline_only"
+    },
+    "source": {
+        "type": "api",
+        "format": "csv",
+        "delimiter": ",",
+        "docIdField": "ClearingDocno",
+        "parentField": "DocumentNumber",
+        "vendorField": "S_C_InternalID",
+        "defaultPriority": "high",
+        "sftp": {
+            "port": 22
+        }
+    },
+    "parent": {
+        "smId": "public:0xd68c98368014f2361b8bde715a68ba6682616031cfe35b23cc6a369755982d5d",
+        "stateTo": "SapInvoice",
+        "refType": ""
+    },
+    "fieldMapping": {
+        "mode": "select_only"
+    },
+    "fields": [],
+    "transformHooks": {
+        "preTransform": {
+            "enabled": true,
+            "type": "script",
+            "timeoutMs": 3000,
+            "retryBackoffMs": 200,
+            "onPartialFailure": "continue",
+            "onTotalFailure": "fail_batch",
+            "script": "import hashlib\nimport time\n\n\ncollectionNames = {\n    \"Invoice\": \"sm_sapinvoice_d68c98\"\n}\n\n\ndef create_hash(v):\n    if not v:\n        return \"\"\n    return \"0x\" + hashlib.sha3_256(str(v).encode('utf-8')).hexdigest()\n\n\ndef fetch_invoice_docs(db, invoice_numbers):\n    invoice_collection = collectionNames.get(\"Invoice\")\n    if not invoice_collection:\n        raise Exception(\"Invoice collection not configured\")\n\n    docs = []\n    # If invoice_numbers is a single string, convert to list\n    if isinstance(invoice_numbers, str):\n        invoice_numbers = [invoice_numbers]\n\n    for inv_num in invoice_numbers:\n        inv_num_str = str(inv_num).strip()\n        if not inv_num_str:\n            continue\n        try:\n            # Use same find_one wrapper pattern as Sap_Invoice.py\n            doc = db.find_one(\n                invoice_collection,\n                {\"DocDetails.D_DocumentNumber\": inv_num_str}\n            )\n            if doc:\n                docs.append(doc)\n                print(f\"Fetched invoice doc for: {inv_num_str}\")\n            else:\n                print(f\"No invoice doc found for: {inv_num_str}\")\n        except Exception as e:\n            print(f\"Error fetching invoice {inv_num_str}: {e}\")\n\n    return docs\n\n\ndef run(doc: dict, db: any, config) -> dict:\n    # 1. Debug prints\n    print(f\"doc count: {len(doc)} :: doc content: {doc}\")\n\n    # 2. Extract Invoice Numbers (relatedInvoiceNumbers or DocumentNumber)\n    invoice_numbers = doc.get(\"relatedInvoiceNumbers\", [])\n    if not invoice_numbers:\n        doc_num = doc.get(\"DocumentNumber\")\n        if doc_num:\n            invoice_numbers = [doc_num]\n\n    if not invoice_numbers or (isinstance(invoice_numbers, list) and not any(invoice_numbers)):\n        raise Exception(\"No invoice numbers found for payment. Document ignored.\")\n\n    # 3. Fetch related invoice docs from common collection\n    invoice_docs = fetch_invoice_docs(db, invoice_numbers)\n    if not invoice_docs:\n        raise Exception(f\"No invoice documents found for parent references: {invoice_numbers}\")\n\n    print(f\"Fetched {len(invoice_docs)} invoice doc(s)\")\n\n    # 4. Key Identifiers\n    # ClearingDocno is primary Payment number. RefDocNumber as fallback.\n    payment_key = (doc.get(\"ClearingDocno\", \"\") or doc.get(\"DocumentNumber\", \"\") or \"\").strip()\n    if not payment_key:\n        raise Exception(\"No payment key found (ClearingDocno/DocumentNumber)\")\n\n    # 5. Aggregate items from all matched invoices\n    all_invoice_items = []\n    for inv_doc in invoice_docs:\n        items = inv_doc.get(\"OrderedItems\", [])\n        if isinstance(items, list):\n            all_invoice_items.extend(items)\n\n    total_quantity = sum(\n        float(item.get(\"I_Quantity\", 0) or 0)\n        for item in all_invoice_items\n    )\n\n    # Use first invoice for header references\n    first_invoice = invoice_docs[0]\n\n    # 6. Initialize target structure based on schema\n    target = {\n        \"DocDetails\": {\n            \"D_DocumentNumber\":               payment_key,\n            \"D_DocumentCreationDate\":         int(time.time() * 1000),\n            \"D_ParentDocumentNumbers\":        invoice_numbers,\n            \"D_MinimumPaymentDuePriceCurrency\": \"INR\",\n            \"D_MinimumPaymentDueMinPrice\":    0,\n            \"D_PaymentDueDate\":               \"\",\n            \"D_PaymentMethod\":                \"\",\n            \"D_OrderStatus\":                  \"\",\n            \"D_TotalPaymentDuePriceCurrency\": doc.get(\"CurrencyKey\", \"INR\"),\n            \"D_TotalPaymentDueMinPrice\":      float(doc.get(\"NetAmount\", 0) or 0),\n            \"D_ScheduledPaymentDate\":         \"\",\n            \"D_ExpectedDeliveryDate\":         \"\",\n            \"D_ExpiryDate\":                   \"\",\n            \"D_PaymentTerms\":                 doc.get(\"TransactionType\", \"\"),\n            \"D_ItemCount\":                    len(all_invoice_items),\n            \"D_TotalQuantity\":                total_quantity,\n            \"D_OffersAddOn\":                  first_invoice.get(\"DocDetails\", {}).get(\"D_OffersAddOn\", []),\n            \"D_DeliveryAddress\":              doc.get(\"Address\", \"\"),\n            \"D_Identifier\":                   create_hash(payment_key)\n        },\n        \"Seller\": first_invoice.get(\"Seller\", {}),\n        \"OrderedItems\": all_invoice_items\n    }\n\n    # 7. Map financial breakdown labels to D_OffersAddOn\n    for label in [\"NetAmount\", \"InvoiceAmount\", \"TDSAmount\"]:\n        val = doc.get(label)\n        if val is not None:\n            try:\n                target[\"DocDetails\"][\"D_OffersAddOn\"].append({\n                    \"D_Name\":  label,\n                    \"D_Price\": float(val),\n                    \"D_Type\":  \"value\",\n                    \"D_Title\": label\n                })\n            except (ValueError, TypeError):\n                pass\n\n    return target"
+        },
+        "processMapping": {
+            "enabled": false,
+            "type": "external",
+            "method": "POST",
+            "timeoutMs": 3000,
+            "retryBackoffMs": 200,
+            "onPartialFailure": "continue",
+            "onTotalFailure": "fail_batch"
+        },
+        "postTransform": {
+            "enabled": false,
+            "type": "external",
+            "method": "POST",
+            "timeoutMs": 3000,
+            "retryBackoffMs": 200,
+            "onPartialFailure": "continue",
+            "onTotalFailure": "fail_batch"
+        }
+    },
+    "createdAt": "2026-03-30T12:09:01.069Z",
+    "updatedAt": "2026-04-06T13:11:23.658Z",
+    "createdBy": "",
+    "deleted": false
+}
